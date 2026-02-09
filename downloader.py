@@ -72,9 +72,11 @@ class SharadarDownloader:
             (tickers['table'] == 'SF1')  # Has fundamental data
         ]
         
-        # Convert date columns
-        tickers['firstpricedate'] = pd.to_datetime(tickers['firstpricedate'])
-        tickers['delisted'] = pd.to_datetime(tickers['delisted'], errors='coerce')
+        # Convert date columns to datetime
+        if 'firstpricedate' in tickers.columns:
+            tickers['firstpricedate'] = pd.to_datetime(tickers['firstpricedate'])
+        if 'lastpricedate' in tickers.columns:
+            tickers['lastpricedate'] = pd.to_datetime(tickers['lastpricedate'])
         
         # Save to cache
         self.storage.save_parquet(tickers, config.TICKERS_FILE)
@@ -82,7 +84,7 @@ class SharadarDownloader:
         
         if config.VERBOSE:
             total = len(tickers)
-            delisted = tickers['isdelisted'].sum()
+            delisted = (tickers['isdelisted'] == 'Y').sum() if 'isdelisted' in tickers.columns else 0
             print(f"✅ Filtered to {total:,} US tickers ({delisted:,} delisted)")
         
         return tickers
@@ -100,31 +102,26 @@ class SharadarDownloader:
                 print("📂 Loading cached SF1 data...")
             return pd.read_parquet(config.SF1_RAW_FILE)
         
-        # Download from API
+        # Download from API (already in wide format)
         sf1 = self.sharadar_client.download_sf1_bulk()
         
-        # Pivot to wide format (one row per ticker-date)
-        sf1_wide = sf1.pivot_table(
-            index=['ticker', 'date'],
-            columns='indicator',
-            values='value',
-            aggfunc='first'
-        ).reset_index()
+        # Data is already in WIDE format from bulk export
+        # No need to pivot - indicators are already columns
         
         # Filter date range
-        sf1_wide = sf1_wide[
-            (sf1_wide['date'] >= config.START_DATE) &
-            (sf1_wide['date'] <= config.END_DATE)
-        ]
+        sf1_filtered = sf1[
+            (sf1['date'] >= config.START_DATE) &
+            (sf1['date'] <= config.END_DATE)
+        ].copy()
         
         # Save to cache
-        self.storage.save_parquet(sf1_wide, config.SF1_RAW_FILE)
+        self.storage.save_parquet(sf1_filtered, config.SF1_RAW_FILE)
         self._save_progress('sf1_downloaded')
         
         if config.VERBOSE:
-            print(f"✅ Filtered to {len(sf1_wide):,} records in date range")
+            print(f"✅ Filtered to {len(sf1_filtered):,} records in date range")
         
-        return sf1_wide
+        return sf1_filtered
     
     def _download_yahoo_prices(self, tickers: pd.DataFrame) -> pd.DataFrame:
         """Step 3: Download Yahoo Finance prices"""
@@ -142,11 +139,12 @@ class SharadarDownloader:
         # Get unique ticker list
         ticker_list = tickers['ticker'].unique().tolist()
         
-        # Download prices
+        # Download prices with metadata for error categorization
         prices = YahooFinanceClient.download_multiple_tickers(
             ticker_list,
             config.START_DATE,
-            config.END_DATE
+            config.END_DATE,
+            ticker_metadata=tickers  # Pass metadata for error categorization
         )
         
         # Save to cache
@@ -161,75 +159,120 @@ class SharadarDownloader:
         prices: pd.DataFrame,
         tickers: pd.DataFrame
     ) -> pd.DataFrame:
-        """Step 4: Process and merge data"""
+        """Step 4: Process and merge data - KEEPS ALL DELISTED STOCKS"""
         if config.VERBOSE:
             print("\n" + "="*60)
             print("STAGE 4: PROCESSING MASTER FILE")
             print("="*60)
         
-        # Forward-fill SHARESBAS to daily frequency
+        # Forward-fill sharesbas to daily frequency
         if config.VERBOSE:
-            print("🔄 Forward-filling SHARESBAS to daily frequency...")
+            print("🔄 Forward-filling sharesbas to daily frequency...")
         
         sf1_daily = sf1.sort_values(['ticker', 'date'])
-        sf1_daily['SHARESBAS'] = sf1_daily.groupby('ticker')['SHARESBAS'].ffill()
+        # Column name is lowercase 'sharesbas' from bulk export
+        sf1_daily['sharesbas'] = sf1_daily.groupby('ticker')['sharesbas'].ffill()
         
         # Convert dates for joining
         sf1_daily['date'] = pd.to_datetime(sf1_daily['date']).dt.date
-        prices['date'] = pd.to_datetime(prices['date']).dt.date
         
-        # Join with prices (LEFT JOIN - keep all SF1 rows)
+        # Only merge with prices if we have them
+        if not prices.empty and len(prices) > 0:
+            prices['date'] = pd.to_datetime(prices['date']).dt.date
+            
+            # Join with prices (LEFT JOIN - keeps ALL SF1 rows, including delisted stocks)
+            if config.VERBOSE:
+                print("🔗 Joining fundamentals with prices...")
+            
+            master = sf1_daily.merge(
+                prices[['ticker', 'date', 'open_price']],
+                on=['ticker', 'date'],
+                how='left'  # Critical: LEFT join keeps all SF1 data
+            )
+            
+            # Calculate market cap (will be NULL for delisted stocks without price data - that's OK!)
+            master['market_cap'] = master['sharesbas'] * master['open_price']
+        else:
+            # No prices - just use SF1 data
+            if config.VERBOSE:
+                print("ℹ️  No price data - outputting fundamentals only")
+            
+            master = sf1_daily.copy()
+            master['open_price'] = None  # Will be added later
+            master['market_cap'] = None  # Will be calculated later
+        
+        # Add delisting metadata (for reference only - NOT for filtering)
         if config.VERBOSE:
-            print("🔗 Joining fundamentals with prices...")
+            print("📅 Adding delisting metadata (not filtering)...")
         
-        master = sf1_daily.merge(
-            prices[['ticker', 'date', 'open_price']],
-            on=['ticker', 'date'],
+        # Add isdelisted flag from tickers table
+        ticker_metadata = tickers[['ticker', 'isdelisted']].drop_duplicates()
+        master = master.merge(
+            ticker_metadata,
+            on='ticker',
             how='left'
         )
         
-        # Calculate market cap (will be NULL if price is NULL)
-        master['market_cap'] = master['SHARESBAS'] * master['open_price']
+        # Add lastpricedate from tickers (for reference)
+        if 'lastpricedate' in tickers.columns:
+            ticker_lastprice = tickers[['ticker', 'lastpricedate']].drop_duplicates()
+            master = master.merge(
+                ticker_lastprice,
+                on='ticker',
+                how='left',
+                suffixes=('', '_sharadar')
+            )
         
-        # Add delisting information
-        if config.VERBOSE:
-            print("📅 Processing delisting dates...")
+        # Get last trade date from Yahoo for each ticker (for reference) - only if we have prices
+        if not prices.empty and len(prices) > 0:
+            last_yahoo_dates = prices.groupby('ticker')['date'].max().reset_index()
+            last_yahoo_dates.columns = ['ticker', 'last_yahoo_date']
+            master = master.merge(
+                last_yahoo_dates,
+                on='ticker',
+                how='left'
+            )
+            # Add flag for whether this row has price data
+            master['has_price_data'] = master['open_price'].notna()
+        else:
+            master['last_yahoo_date'] = None
+            master['has_price_data'] = False
         
-        # Get last trade date from Yahoo for each ticker
-        last_trade_dates = prices.groupby('ticker')['date'].max().to_dict()
-        
-        # Get Sharadar delisting dates
-        sharadar_delistings = tickers.set_index('ticker')['delisted'].to_dict()
-        
-        # Use earlier of Yahoo last trade or Sharadar delisting
-        def get_effective_delisting(ticker):
-            yahoo_last = last_trade_dates.get(ticker)
-            sharadar_last = sharadar_delistings.get(ticker)
-            
-            if pd.isna(sharadar_last):
-                return yahoo_last  # Still listed or Yahoo is authority
-            if yahoo_last is None:
-                return pd.to_datetime(sharadar_last).date()
-            
-            return min(yahoo_last, pd.to_datetime(sharadar_last).date())
-        
-        master['effective_delisting'] = master['ticker'].apply(get_effective_delisting)
-        
-        # Filter out data after effective delisting
-        master = master[
-            (master['effective_delisting'].isna()) |
-            (master['date'] <= master['effective_delisting'])
-        ]
-        
-        # Clean up
-        master = master.drop(columns=['effective_delisting'])
+        # Sort by date and ticker
         master = master.sort_values(['date', 'ticker']).reset_index(drop=True)
         
         if config.VERBOSE:
             print(f"✅ Master file created: {len(master):,} rows")
-            null_count = master['market_cap'].isna().sum()
-            null_pct = null_count / len(master) * 100
-            print(f"   Market cap nulls: {null_count:,} ({null_pct:.2f}%)")
+            
+            # Statistics
+            total_tickers = master['ticker'].nunique()
+            
+            if 'isdelisted' in master.columns:
+                delisted_tickers = master[master['isdelisted'] == 'Y']['ticker'].nunique()
+                active_tickers = master[master['isdelisted'] == 'N']['ticker'].nunique()
+                print(f"   Total unique tickers: {total_tickers:,}")
+                print(f"   Active tickers: {active_tickers:,} ({active_tickers/total_tickers*100:.1f}%)")
+                print(f"   Delisted tickers: {delisted_tickers:,} ({delisted_tickers/total_tickers*100:.1f}%)")
+            
+            # Price data coverage
+            if config.SKIP_YAHOO_DOWNLOAD:
+                print(f"   Price data: NOT DOWNLOADED (will be added later)")
+                print(f"   Shares outstanding: FORWARD-FILLED for daily frequency")
+            else:
+                rows_with_price = master['has_price_data'].sum()
+                rows_without_price = (~master['has_price_data']).sum()
+                price_coverage_pct = rows_with_price / len(master) * 100
+                
+                print(f"   Rows with price data: {rows_with_price:,} ({price_coverage_pct:.1f}%)")
+                print(f"   Rows without price data: {rows_without_price:,} ({100-price_coverage_pct:.1f}%)")
+                
+                # Market cap statistics
+                null_market_cap = master['market_cap'].isna().sum()
+                null_pct = null_market_cap / len(master) * 100
+                print(f"   Market cap nulls: {null_market_cap:,} ({null_pct:.1f}%)")
+            
+            # Confirm no filtering happened
+            print(f"\n   ⚠️  IMPORTANT: NO ROWS WERE FILTERED - all fundamental data preserved")
         
         return master
     
@@ -315,6 +358,133 @@ class SharadarDownloader:
         if config.VERBOSE:
             print(f"✅ Daily files saved to {config.OUTPUT_DIR}/")
     
+    def _export_ticker_universe_csv(self, tickers: pd.DataFrame):
+        """Export complete ticker universe to CSV (ticker symbols only)"""
+        if config.VERBOSE:
+            print("\n" + "="*60)
+            print("EXPORTING TICKER UNIVERSE CSV")
+            print("="*60)
+        
+        # Create DataFrame with only ticker column
+        export_df = pd.DataFrame({'symbol': tickers['ticker']})
+        
+        # Sort alphabetically
+        export_df = export_df.sort_values('symbol')
+        
+        # Remove duplicates (if any)
+        export_df = export_df.drop_duplicates()
+        
+        # Define output path
+        csv_path = Path(config.OUTPUT_DIR) / "ticker_universe.csv"
+        
+        # Export to CSV
+        export_df.to_csv(csv_path, index=False)
+        
+        if config.VERBOSE:
+            total_tickers = len(export_df)
+            delisted_count = (tickers['isdelisted'] == 'Y').sum() if 'isdelisted' in tickers.columns else 0
+            active_count = len(tickers) - delisted_count
+            
+            print(f"✅ Ticker universe exported to: {csv_path}")
+            print(f"   Total tickers: {total_tickers:,}")
+            print(f"   Active: {active_count:,}")
+            print(f"   Delisted: {delisted_count:,}")
+    
+    def _export_ticker_universe_symbols_csv(self, tickers: pd.DataFrame):
+        """Export all ticker symbols (single column, includes delisted)"""
+        if config.VERBOSE:
+            print("\n" + "="*60)
+            print("EXPORTING TICKER SYMBOLS CSV")
+            print("="*60)
+        
+        # Create DataFrame with only ticker column (ALL tickers)
+        export_df = pd.DataFrame({'symbol': tickers['ticker']})
+        
+        # Sort alphabetically
+        export_df = export_df.sort_values('symbol')
+        
+        # Remove duplicates (if any)
+        export_df = export_df.drop_duplicates()
+        
+        # Define output path
+        csv_path = Path(config.OUTPUT_DIR) / "ticker_universe_symbols.csv"
+        
+        # Export to CSV
+        export_df.to_csv(csv_path, index=False)
+        
+        if config.VERBOSE:
+            total_tickers = len(export_df)
+            delisted_count = (tickers['isdelisted'] == 'Y').sum() if 'isdelisted' in tickers.columns else 0
+            active_count = len(tickers) - delisted_count
+            
+            print(f"✅ Ticker symbols exported to: {csv_path}")
+            print(f"   Total tickers: {total_tickers:,}")
+            print(f"   Active: {active_count:,}")
+            print(f"   Delisted: {delisted_count:,}")
+
+    def _export_ticker_universe_verbose_csv(self, tickers: pd.DataFrame):
+        """Export complete ticker universe with all metadata (includes delisted)"""
+        if config.VERBOSE:
+            print("\n" + "="*60)
+            print("EXPORTING VERBOSE TICKER UNIVERSE CSV")
+            print("="*60)
+        
+        # Select relevant columns for verbose export
+        export_columns = [
+            'ticker',
+            'name',
+            'exchange',
+            'isdelisted',
+            'category',
+            'sector',
+            'industry',
+            'scalemarketcap',
+            'siccode',
+            'sicindustry',
+            'famasector',
+            'famaindustry',
+            'currency',
+            'location',
+            'firstpricedate',
+            'lastpricedate',
+            'firstquarter',
+            'lastquarter',
+            'secfilings',
+            'companysite',
+            'delisted',
+            'permaticker',
+            'relatedtickers'
+        ]
+        
+        # Filter to only existing columns
+        available_columns = [col for col in export_columns if col in tickers.columns]
+        export_df = tickers[available_columns].copy()
+        
+        # Sort by delisting status (active first), then exchange, then ticker
+        export_df = export_df.sort_values(['isdelisted', 'exchange', 'ticker'])
+        
+        # Define output path
+        csv_path = Path(config.OUTPUT_DIR) / "ticker_universe_verbose.csv"
+        
+        # Export to CSV
+        export_df.to_csv(csv_path, index=False)
+        
+        if config.VERBOSE:
+            total_tickers = len(export_df)
+            delisted_count = (export_df['isdelisted'] == 'Y').sum() if 'isdelisted' in export_df.columns else 0
+            active_count = total_tickers - delisted_count
+            
+            print(f"✅ Verbose ticker universe exported to: {csv_path}")
+            print(f"   Total tickers: {total_tickers:,}")
+            print(f"   Active: {active_count:,}")
+            print(f"   Delisted: {delisted_count:,}")
+            
+            # Show exchange breakdown
+            if 'exchange' in export_df.columns:
+                print(f"\n   Exchange breakdown:")
+                for exchange, count in export_df['exchange'].value_counts().items():
+                    print(f"      {exchange}: {count:,}")
+    
     def run(self):
         """Main execution method"""
         try:
@@ -328,13 +498,30 @@ class SharadarDownloader:
                 print(f"  Date Range: {config.START_DATE} to {config.END_DATE}")
                 print(f"  Dimension: {config.DIMENSION}")
                 print(f"  Indicators: {', '.join(config.INDICATORS)}")
-                print(f"  Price Field: {config.PRICE_FIELD}")
+                if config.SKIP_YAHOO_DOWNLOAD:
+                    print(f"  Price Source: SKIPPED - will be added from another API later")
+                else:
+                    print(f"  Price Field: {config.PRICE_FIELD}")
                 print(f"  Exchanges: {', '.join(config.EXCHANGES)}")
             
             # Execute pipeline
             tickers = self._download_tickers()
+            self._export_ticker_universe_symbols_csv(tickers)
+            self._export_ticker_universe_verbose_csv(tickers)
             sf1 = self._download_sf1()
-            prices = self._download_yahoo_prices(tickers)
+            
+            # Conditionally download Yahoo prices
+            if config.SKIP_YAHOO_DOWNLOAD:
+                if config.VERBOSE:
+                    print("\n" + "="*60)
+                    print("STAGE 3: SKIPPING YAHOO FINANCE (per config)")
+                    print("="*60)
+                    print("   ℹ️  Price data will be added from another API later")
+                    print("   ℹ️  Outputting ticker universe with daily shares outstanding")
+                prices = pd.DataFrame(columns=['ticker', 'date', 'open_price'])  # Empty DataFrame
+            else:
+                prices = self._download_yahoo_prices(tickers)
+            
             master = self._process_master_file(sf1, prices, tickers)
             self._validate_and_save_master(master)
             self._split_to_daily_files(master)
@@ -353,8 +540,11 @@ class SharadarDownloader:
                 print(f"Daily Files Created: {len(list(Path(config.OUTPUT_DIR).glob('*.parquet'))):,}")
                 print(f"Master File: {config.MASTER_FILE}")
                 print(f"Validation Log: {config.VALIDATION_LOG}")
+                if config.SKIP_YAHOO_DOWNLOAD:
+                    print(f"\n💡 Next Step: Add price data from your chosen API")
+                    print(f"   Columns to add: open_price, market_cap")
                 print("="*60 + "\n")
-            
+        
         except Exception as e:
             if config.VERBOSE:
                 print(f"\n❌ ERROR: {e}")

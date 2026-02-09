@@ -11,6 +11,7 @@ import io
 from typing import List, Optional
 from tqdm import tqdm
 import config
+import logging
 
 
 class SharadarClient:
@@ -87,22 +88,22 @@ class SharadarClient:
                 response = requests.get(url, params=params, timeout=30)
                 
                 if response.status_code == 429:
-                    # Rate limited - we hit 5,000 calls in 10 minutes (unlikely for TICKERS)
-                    # OR account was already blocked from previous run
+                    data = response.json()
+                    error_code = data.get('quandl_error', {}).get('code', 'UNKNOWN')
                     
-                    if config.VERBOSE:
-                        print(f"\n❌ RATE LIMITED (HTTP 429)")
-                        print(f"   This means you hit 5,000 API calls in the last 10 minutes,")
-                        print(f"   OR your account is still blocked from a previous violation.")
-                        print(f"\n⏰ SOLUTION: Wait 10+ minutes before retrying.")
-                        print(f"   Current time: {time.strftime('%H:%M:%S')}")
-                        print(f"   Retry after: {time.strftime('%H:%M:%S', time.localtime(time.time() + 660))}")
-                    
-                    # Don't retry automatically - let user wait manually
-                    raise Exception(
-                        f"Rate limited. Wait 10+ minutes before retrying. "
-                        f"If problem persists, contact clientsuccess@nasdaq.com"
-                    )
+                    if 'QELx04' in str(error_code):
+                        # 10-minute limit
+                        print("Hit 10-minute call limit (5,000 calls)")
+                        raise Exception(
+                            f"Rate limited. Wait 10+ minutes before retrying. "
+                            f"If problem persists, contact clientsuccess@nasdaq.com"
+                        )
+                    elif 'QELx03' in str(error_code):
+                        # Daily limit
+                        print("Hit daily call limit (720,000 calls)")
+                        raise Exception(
+                            f"Daily call limit reached. Try again later."
+                        )
                 
                 response.raise_for_status()
                 data = response.json()
@@ -191,20 +192,33 @@ class SharadarClient:
                 
                 # Step 3: Poll until export is ready
                 elapsed = 0
-                while status == "regenerating" and elapsed < config.EXPORT_MAX_WAIT:
+                # Poll for any non-final status (creating, regenerating, etc.)
+                while status not in ["fresh", "failed"] and elapsed < config.EXPORT_MAX_WAIT:
                     if config.VERBOSE:
-                        print(f"   Waiting for export... ({elapsed}s)")
+                        print(f"   Waiting for export... Status: {status} ({elapsed}s)")
                     time.sleep(config.EXPORT_POLL_INTERVAL)
                     elapsed += config.EXPORT_POLL_INTERVAL
                     
                     # Check status (doesn't count against rate limit)
-                    check_response = requests.get(download_url)
-                    if check_response.status_code == 200:
-                        check_data = check_response.json()
-                        status = check_data.get('file', {}).get('status', status)
+                    try:
+                        check_response = requests.get(download_url, timeout=30)
+                        if check_response.status_code == 200:
+                            check_data = check_response.json()
+                            # Handle both direct status or nested file status
+                            if 'datatable_bulk_download' in check_data:
+                                status = check_data['datatable_bulk_download']['file']['status']
+                            elif 'file' in check_data:
+                                status = check_data['file']['status']
+                            else:
+                                status = check_data.get('status', status)
+                    except Exception as poll_error:
+                        if config.VERBOSE:
+                            print(f"   Poll error (will retry): {poll_error}")
                 
-                if status != "fresh":
-                    raise Exception(f"Export timeout or failed. Status: {status}")
+                if status == "failed":
+                    raise Exception(f"Export failed on server side")
+                elif status != "fresh":
+                    raise Exception(f"Export timeout. Last status: {status}. Try increasing EXPORT_MAX_WAIT in config.")
                 
                 # Step 4: Download zip file
                 if config.VERBOSE:
@@ -263,28 +277,64 @@ class SharadarClient:
         
         SF1 is large (~20M+ rows) so bulk export is necessary.
         Uses 1 of your 10 bulk exports per hour.
+        
+        Note: Bulk exports return data in WIDE format (indicators as columns),
+        not LONG format (indicator column with values).
         """
         if config.VERBOSE:
             print("📊 Downloading SHARADAR/SF1 bulk export...")
             print(f"   Dimension: {config.DIMENSION}")
-            print(f"   Indicators: {', '.join(config.INDICATORS)}")
+            if config.INDICATORS:
+                print(f"   Will select indicators: {', '.join(config.INDICATORS)}")
         
         try:
             # Build filter parameters
+            # NOTE: Bulk exports only support dimension filter, not indicator filter
             filters = {
                 'dimension': config.DIMENSION,
             }
             
-            # Add indicators filter (comma-separated list)
-            if config.INDICATORS:
-                filters['indicator'] = ','.join(config.INDICATORS)
-            
             # Use bulk export with proper rate limiting
             df = self._download_bulk_export('SHARADAR/SF1', **filters)
+            
+            if config.VERBOSE:
+                print(f"   Downloaded {len(df):,} rows with {len(df.columns)} columns")
+            
+            # Filter by indicators AFTER download
+            # Bulk export returns WIDE format: each indicator is a column
+            if config.INDICATORS:
+                # Keep core columns plus requested indicators
+                core_columns = ['ticker', 'dimension', 'calendardate', 'datekey', 'reportperiod', 'lastupdated']
+                available_core = [col for col in core_columns if col in df.columns]
+                
+                # Case-insensitive matching for indicators
+                # Convert both config indicators and df columns to lowercase for comparison
+                indicators_lower = [ind.lower() for ind in config.INDICATORS]
+                available_indicators = [col for col in df.columns if col.lower() in indicators_lower]
+                
+                if not available_indicators:
+                    raise ValueError(
+                        f"None of the requested indicators {config.INDICATORS} found in dataset. "
+                        f"Available columns: {list(df.columns)}"
+                    )
+                
+                # Select only needed columns
+                columns_to_keep = available_core + available_indicators
+                df = df[columns_to_keep]
+                
+                if config.VERBOSE:
+                    requested_set = set(ind.lower() for ind in config.INDICATORS)
+                    found_set = set(col.lower() for col in available_indicators)
+                    missing = requested_set - found_set
+                    if missing:
+                        print(f"   ⚠️  Missing indicators: {missing}")
+                    print(f"   Filtered to {len(columns_to_keep)} columns ({len(available_indicators)} indicators)")
             
             # Convert date column
             if 'datekey' in df.columns:
                 df['date'] = pd.to_datetime(df['datekey'])
+            elif 'calendardate' in df.columns:
+                df['date'] = pd.to_datetime(df['calendardate'])
             
             if config.VERBOSE:
                 print(f"✅ Downloaded {len(df):,} fundamental records")
@@ -318,18 +368,43 @@ class SharadarClient:
 class YahooFinanceClient:
     """Client for Yahoo Finance data"""
     
+    # Suppress yfinance's verbose logging
+    logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+    
     @staticmethod
     def download_ticker_history(
         ticker: str,
         start_date: str,
-        end_date: str
+        end_date: str,
+        ticker_metadata: Optional[pd.DataFrame] = None
     ) -> Optional[pd.DataFrame]:
-        """Download historical OHLCV data for a single ticker"""
+        """Download historical OHLCV data for a single ticker
+        
+        Handles special suffixes (.U, .WS, etc.) that Yahoo may not recognize
+        Categorizes failures for better error reporting
+        
+        Args:
+            ticker: Stock ticker symbol
+            start_date: Start date for download
+            end_date: End date for download
+            ticker_metadata: Optional DataFrame with ticker info (for error categorization)
+        """
         try:
+            # Try original ticker first (suppress yfinance output)
             ticker_obj = yf.Ticker(ticker)
-            hist = ticker_obj.history(start=start_date, end=end_date)
+            hist = ticker_obj.history(start=start_date, end=end_date, progress=False)
+            
+            # If empty and ticker has a suffix, try without it
+            if hist.empty and '.' in ticker:
+                base_ticker = ticker.split('.')[0]
+                ticker_obj = yf.Ticker(base_ticker)
+                hist = ticker_obj.history(start=start_date, end=end_date, progress=False)
+                
+                if not hist.empty:
+                    ticker = base_ticker
             
             if hist.empty:
+                YahooFinanceClient._log_download_failure(ticker, "No data available", ticker_metadata, start_date)
                 return None
             
             # Extract only what we need
@@ -340,22 +415,114 @@ class YahooFinanceClient:
             })
             
             df['date'] = pd.to_datetime(df['date']).dt.date
-            
             return df
             
         except Exception as e:
-            if config.VERBOSE:
-                print(f"⚠️  Failed to download {ticker}: {e}")
+            # If ticker has suffix, try base ticker before giving up
+            if '.' in ticker:
+                try:
+                    base_ticker = ticker.split('.')[0]
+                    ticker_obj = yf.Ticker(base_ticker)
+                    hist = ticker_obj.history(start=start_date, end=end_date, progress=False)
+                    
+                    if not hist.empty:
+                        df = pd.DataFrame({
+                            'date': hist.index,
+                            'ticker': base_ticker,
+                            'open_price': hist['Open'].values
+                        })
+                        df['date'] = pd.to_datetime(df['date']).dt.date
+                        return df
+                except:
+                    pass
+            
+            YahooFinanceClient._log_download_failure(ticker, str(e), ticker_metadata, start_date)
             return None
+    
+    @staticmethod
+    def _log_download_failure(ticker: str, error: str, metadata: Optional[pd.DataFrame], start_date: str):
+        """Categorize and log download failures with context"""
+        if not config.VERBOSE:
+            return
+        
+        # Check for SPAC units and special securities FIRST
+        if '.' in ticker:
+            suffix = ticker.split('.')[-1]
+            if suffix in ['U', 'UN']:
+                print(f"⚠️  {ticker}: SPAC Unit (suffix .{suffix})")
+                return
+            elif suffix in ['WS', 'WT', 'W']:
+                print(f"⚠️  {ticker}: Warrant (suffix .{suffix})")
+                return
+            elif suffix in ['RT', 'R']:
+                print(f"⚠️  {ticker}: Rights (suffix .{suffix})")
+                return
+        
+        # Pattern: Ends with 'U' (SPAC units without period)
+        if ticker.endswith('U') and len(ticker) > 4:
+            print(f"⚠️  {ticker}: Likely SPAC Unit (ends with U)")
+            return
+        
+        # Pattern: Known SPAC/warrant patterns
+        if ticker.endswith(('WT', 'WS', 'RT')):
+            print(f"⚠️  {ticker}: Likely Warrant/Rights")
+            return
+        
+        # Check metadata if available
+        if metadata is not None and isinstance(metadata, pd.DataFrame):
+            ticker_matches = metadata[metadata['ticker'] == ticker]
+            if len(ticker_matches) > 0:
+                ticker_info = ticker_matches.iloc[0]
+                
+                # Check Sharadar's isdelisted field
+                if 'isdelisted' in ticker_info and ticker_info['isdelisted'] == 'Y':
+                    # Sharadar says it's delisted
+                    if 'lastpricedate' in ticker_info and pd.notna(ticker_info['lastpricedate']):
+                        try:
+                            last_price = pd.to_datetime(ticker_info['lastpricedate'])
+                            start = pd.to_datetime(start_date)
+                            
+                            if last_price < start:
+                                years_before = (start - last_price).days / 365.25
+                                print(f"⚠️  {ticker}: Delisted {years_before:.1f}y before {start_date[:4]}")
+                                return
+                            else:
+                                print(f"⚠️  {ticker}: Delisted (last: {last_price.strftime('%Y-%m-%d')})")
+                                return
+                        except:
+                            print(f"⚠️  {ticker}: Delisted (Sharadar)")
+                            return
+                    
+                    print(f"⚠️  {ticker}: Delisted (no Yahoo history)")
+                    return
+                
+                # Sharadar says "active" but Yahoo has no data
+                # This is VERY common - don't treat as unusual
+                print(f"⚠️  {ticker}: Not tracked by Yahoo (OTC/SPAC/changed symbol)")
+                return
+        
+        # Not found in metadata
+        print(f"⚠️  {ticker}: Not in filtered ticker list")
     
     @staticmethod
     def download_multiple_tickers(
         tickers: List[str],
         start_date: str,
-        end_date: str
+        end_date: str,
+        ticker_metadata: Optional[pd.DataFrame] = None
     ) -> pd.DataFrame:
         """Download historical data for multiple tickers with progress bar"""
         all_data = []
+        error_stats = {
+            'spac_units': 0,
+            'warrants': 0,
+            'rights': 0,
+            'delisted_pre_2016': 0,
+            'delisted_other': 0,
+            'not_tracked_yahoo': 0,  # NEW: Sharadar has it, Yahoo doesn't
+            'not_in_metadata': 0,     # NEW: Not found in filtered tickers
+            'success': 0
+        }
         
         if config.VERBOSE:
             print(f"💰 Downloading Yahoo Finance data for {len(tickers):,} tickers...")
@@ -367,10 +534,61 @@ class YahooFinanceClient:
                 
                 for ticker in batch:
                     df = YahooFinanceClient.download_ticker_history(
-                        ticker, start_date, end_date
+                        ticker, start_date, end_date, ticker_metadata
                     )
                     if df is not None:
                         all_data.append(df)
+                        error_stats['success'] += 1
+                    else:
+                        # Categorize failure - MUST MATCH _log_download_failure logic EXACTLY
+                        
+                        # 1. Check for suffix patterns
+                        if '.' in ticker:
+                            suffix = ticker.split('.')[-1]
+                            if suffix in ['U', 'UN']:
+                                error_stats['spac_units'] += 1
+                            elif suffix in ['WS', 'WT', 'W']:
+                                error_stats['warrants'] += 1
+                            elif suffix in ['RT', 'R']:
+                                error_stats['rights'] += 1
+                            else:
+                                error_stats['not_tracked_yahoo'] += 1  # Unknown suffix
+                        
+                        # 2. Check for ticker ending with U (SPAC unit)
+                        elif ticker.endswith('U') and len(ticker) > 4:
+                            error_stats['spac_units'] += 1
+                        
+                        # 3. Check for warrant/rights patterns
+                        elif ticker.endswith(('WT', 'WS', 'RT')):
+                            error_stats['warrants'] += 1
+                        
+                        # 4. Check metadata for delisting info
+                        elif ticker_metadata is not None and ticker in ticker_metadata['ticker'].values:
+                            ticker_info = ticker_metadata[ticker_metadata['ticker'] == ticker].iloc[0]
+                            
+                            # Check if Sharadar says it's delisted
+                            if 'isdelisted' in ticker_info and ticker_info['isdelisted'] == 'Y':
+                                # Delisted according to Sharadar
+                                if 'lastpricedate' in ticker_info and pd.notna(ticker_info['lastpricedate']):
+                                    try:
+                                        last_price = pd.to_datetime(ticker_info['lastpricedate'])
+                                        start = pd.to_datetime(start_date)
+                                        if last_price < start:
+                                            error_stats['delisted_pre_2016'] += 1
+                                        else:
+                                            error_stats['delisted_other'] += 1
+                                    except:
+                                        error_stats['delisted_other'] += 1
+                                else:
+                                    error_stats['delisted_other'] += 1
+                            else:
+                                # Sharadar says "active" (isdelisted = 'N') but Yahoo doesn't have it
+                                # This is COMMON for OTC/SPAC/changed symbols
+                                error_stats['not_tracked_yahoo'] += 1
+                        
+                        # 5. Not found in metadata at all
+                        else:
+                            error_stats['not_in_metadata'] += 1
                     
                     pbar.update(1)
                 
@@ -384,6 +602,16 @@ class YahooFinanceClient:
         result = pd.concat(all_data, ignore_index=True)
         
         if config.VERBOSE:
-            print(f"✅ Downloaded price data for {len(result['ticker'].unique()):,} tickers")
+            print(f"\n✅ Downloaded price data for {len(result['ticker'].unique()):,} tickers")
+            print(f"\n📊 Download Statistics:")
+            print(f"   Success: {error_stats['success']:,} ({error_stats['success']/len(tickers)*100:.1f}%)")
+            print(f"   Failed - SPAC Units: {error_stats['spac_units']:,}")
+            print(f"   Failed - Warrants/Rights: {error_stats['warrants'] + error_stats['rights']:,}")
+            print(f"   Failed - Delisted pre-2016: {error_stats['delisted_pre_2016']:,}")
+            print(f"   Failed - Delisted (other): {error_stats['delisted_other']:,}")
+            print(f"   Failed - Not tracked by Yahoo: {error_stats['not_tracked_yahoo']:,}")
+            print(f"   Failed - Not in metadata: {error_stats['not_in_metadata']:,}")
+            total_failed = len(tickers) - error_stats['success']
+            print(f"   Total Failed: {total_failed:,} ({total_failed/len(tickers)*100:.1f}%)")
         
         return result

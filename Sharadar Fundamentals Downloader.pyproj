@@ -13,7 +13,7 @@
     <RootNamespace>Sharadar Fundamentals Downloader</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
     <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
-    <Environment>NASDAQ_API_KEY=Zo7hh3b9aYF7Fpsba_hb</Environment>
+    <Environment>NASDAQ_API_KEY=_fBGpgxN1ta95vmmK3to</Environment>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>

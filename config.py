@@ -15,7 +15,12 @@ if not NASDAQ_API_KEY:
     raise ValueError("NASDAQ_API_KEY environment variable not set")
 
 # Rate Limiting - Updated for Nasdaq bulk export limits
-API_REQUEST_DELAY = 2.0  # Wait 2 seconds between API calls (PROACTIVE rate limiting)
+# Recommended for paid account
+API_REQUEST_DELAY = 0.5  # 2 calls/sec = 1,200 calls per 10 min (24% of limit)
+
+# Aggressive (still safe)
+API_REQUEST_DELAY = 0.15  # ~6.6 calls/sec = 4,000 calls per 10 min (80% of limit)
+
 MAX_RETRIES = 3
 
 # Bulk Export Rate Limits (Nasdaq Premium)
@@ -32,14 +37,19 @@ START_DATE = "2016-01-01"
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')  # Yesterday
 
 # Exchanges (US-based only)
-EXCHANGES = ["NASDAQ", "NYSE", "NYSEARCA", "NYSEMKT"]  # NYSEMKT = AMEX
+EXCHANGES = [
+    'NYSE',          # New York Stock Exchange
+    'NASDAQ',        # NASDAQ
+    'NYSEAMERICAN',  # American Stock Exchange (AMEX) - now called NYSE American
+]
 
 # Sharadar Parameters
 DIMENSION = "ARQ"  # As-Reported Quarterly (best for backtesting)
 INDICATORS = ["SHARESBAS"]  # Basic Shares Outstanding
 
-# Price Source
-PRICE_FIELD = "Open"  # Use open price to avoid forward-looking bias
+# Price Source Configuration
+SKIP_YAHOO_DOWNLOAD = True  # Set to True to skip Yahoo Finance (add prices from another API later)
+PRICE_FIELD = "Open"  # Use open price to avoid forward-looking bias (when Yahoo is enabled)
 
 # Directories
 CACHE_DIR = "T:/fundamentals/cache"
@@ -47,7 +57,7 @@ OUTPUT_DIR = "T:/fundamentals/output"
 
 # Validation Thresholds
 NULL_THRESHOLD_WARN = 0.01  # Warn if >1% nulls
-NULL_THRESHOLD_FAIL = 0.05  # Fail if >5% nulls
+NULL_THRESHOLD_FAIL = 0.05  # Fail if >5% nulls (DISABLED when skipping Yahoo)
 
 # Processing
 VERBOSE = True
